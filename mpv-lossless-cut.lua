@@ -316,6 +316,10 @@ local function render_cut(input, outpath, start, duration, input_mtime)
 		table.insert(args, "48000")
 		table.insert(args, "-ac")
 		table.insert(args, "2")
+
+		-- encode as mp4
+		table.insert(args, "-f")
+		table.insert(args, "mp4")
 	end
 
 	table.insert(args, outpath)
@@ -448,7 +452,12 @@ local function cut_render()
 			local temp_cache_file_name = join_paths(outdir, "cache-dump.mkv")
 
 			if not is_stream then
-				filename_noext, ext = filename:match("^(.*)(%.[^%.]+)$")
+				if options.lossless then
+					filename_noext, ext = filename:match("^(.*)(%.[^%.]+)$")
+				else
+					filename_noext = sanitize_filename(cut.media_title)
+					ext = ".mp4"
+				end
 			else
 				filename_noext = sanitize_filename(cut.media_title)
 				ext = ".mkv"
@@ -495,7 +504,13 @@ local function cut_render()
 	end
 
 	if #cut_paths > 1 and options.multi_cut_mode == "merge" then
-		local merge_name = string.format("(%d merged cuts) %s", #cut_paths, cuts[1].filename)
+		local cut_base_name = ""
+		if options.lossless then
+			cut_base_name = cuts[1].filename
+		else
+			cut_base_name = sanitize_filename(cuts[1].media_title) .. ".mp4"
+		end
+		local merge_name = string.format("(%d merged cuts) %s", #cut_paths, cut_base_name)
 		local merge_path = join_paths(outdir, merge_name)
 
 		log("Merging cuts...")
