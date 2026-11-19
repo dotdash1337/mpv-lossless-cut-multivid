@@ -298,7 +298,7 @@ local function render_cut(input, outpath, start, duration, input_mtime)
 
 		-- vf runs on cpu, encode runs on gpu
 		table.insert(args, "-vf")
-		table.insert(args, "crop=" .. bestCrop .. ",tblend=all_mode=average,fps=60,scale=1920:1080:flags=lanczos")
+		table.insert(args, "crop=" .. bestCrop .. ",tmix=frames=5:weights='1 1 1 1 1',fps=60,scale=1920:1080:flags=lanczos")
 		table.insert(args, "-fps_mode")
 		table.insert(args, "cfr")
 		table.insert(args, "-c:v")
