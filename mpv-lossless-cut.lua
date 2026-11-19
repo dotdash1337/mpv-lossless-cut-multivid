@@ -161,60 +161,26 @@ local function delete_file(file_path)
 	return res.status == 0
 end
 
-local function set_file_times(file_path, mtime)
-	if not mtime then
-		mp.msg.warn("No mtime provided for: " .. file_path)
-		return false
-	end
+local function remove_existing_output(file_path)
+    local file_info = mp.utils.file_info(file_path)
 
-	local file_info = mp.utils.file_info(file_path)
-	if not file_info then
-		mp.msg.error("File does not exist, cannot set times: " .. file_path)
-		return false
-	end
+    if not file_info then
+        return true
+    end
 
-	local normalized_path = file_path:gsub([[\]], "/")
-	local success = false
-	local result
+    if file_info.is_dir then
+        mp.msg.error("Output path is a directory: " .. file_path)
+        return false
+    end
 
-	if os_name == "windows" then
-		result = mp.utils.subprocess({
-			args = {
-				"powershell",
-				"-command",
-				string.format(
-					"$file = Get-Item -LiteralPath '%s'; "
-						.. '$date = (Get-Date "1970-01-01 00:00:00").AddSeconds(%d).ToLocalTime(); '
-						.. "$file.CreationTime = $date; "
-						.. "$file.LastWriteTime = $date",
-					normalized_path:gsub("/", "\\"):gsub("'", "''"),
-					mtime
-				),
-			},
-			cancellable = false,
-		})
-	else
-		result = mp.utils.subprocess({
-			args = {
-				"touch",
-				"-t",
-				os.date("!%Y%m%d%H%M.%S", mtime),
-				normalized_path,
-			},
-			cancellable = false,
-		})
-	end
+    local success, error_msg = os.remove(file_path)
 
-	success = (result.status == 0)
+    if not success then
+        mp.msg.error("Failed to remove existing output: " .. error_msg)
+        return false
+    end
 
-	if not success then
-		local error_msg = result.stderr or result.stdout or "Unknown error"
-		mp.msg.error("Failed to set file times for " .. file_path .. ": " .. error_msg)
-	else
-		mp.msg.verbose("Successfully set file times for: " .. file_path)
-	end
-
-	return success
+    return true
 end
 
 -- ffmpeg operations
@@ -249,7 +215,77 @@ local function run_ffmpeg(args, use_output)
 	return result.status == 0, result.stdout, result.stderr
 end
 
-local function render_cut(input, outpath, start, duration, input_mtime)
+local function run_ffprobe(args)
+	local base_args = {
+		"ffprobe",
+	}
+
+	-- add args to base
+	for _, arg in ipairs(args) do
+		table.insert(base_args, arg)
+	end
+
+	local cmd_str = table.concat(base_args, " ")
+	print("Running ffprobe command: " .. cmd_str)
+
+	local result = mp.utils.subprocess({
+		args = base_args,
+		cancellable = false,
+		capture_stdout = true,
+        capture_stderr = true,
+	})
+
+	return result.status == 0, result.stdout, result.stderr
+end
+
+-- grab video fps via ffprobe
+local function get_video_fps(input)
+	success, stdout, stderr = run_ffprobe({
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=avg_frame_rate,r_frame_rate",
+		"-of", "default=noprint_wrappers=1",
+		input,
+	})
+
+	local function parse_rate(rate)
+		rate = rate:match("^%s*(.-)%s*$")
+		local numerator, denominator = rate:match("^([%d%.]+)/([%d%.]+)$")
+		if numerator and denominator then
+			numerator = tonumber(numerator)
+			denominator = tonumber(denominator)
+			if denominator and denominator > 0 then
+				return numerator / denominator
+			end
+		end
+
+		return tonumber(rate)
+	end
+
+	-- parse the output 
+	local average_rate, fallback_rate
+	for line in stderr:gmatch("[^\r\n]+") do
+		local key, value = line:match("^([^=]+)=(.+)$")
+		if key == "avg_frame_rate" then
+			average_rate = value
+		elseif key == "r_frame_rate" then
+			-- fallback to r_frame_rate if avg is unavailable
+			fallback_rate = value
+		end
+	end
+
+	local fps = average_rate and parse_rate(average_rate) or nil
+	if not fps or fps <= 0 then
+		fps = fallback_rate and parse_rate(fallback_rate) or nil
+	end
+	if fps and fps > 0 then
+		return fps
+	end
+
+	return nil
+end
+
+local function render_cut(input, outpath, start, duration)
 	local args = {
 		-- seek to start before loading file (faster) https://trac.ffmpeg.org/wiki/Seeking#Inputseeking
 		"-ss",
@@ -296,9 +332,48 @@ local function render_cut(input, outpath, start, duration, input_mtime)
 			end
 		end
 
+		-- default to 60fps for non lossless
+		local output_fps = 60
+
+		-- set our frame number to be the divisor for getting a clean 60fps out via frame blending
+		-- 120 / 2 = 60fps, so 2 source frames, 240 / 4 = 60 (4 source frames), 300 / 5 = 60 (5 source frames), etc.
+		-- ex: 120 -> 2 frames, 240 -> 4 frames, 300 -> 5 frames.
+		local source_fps = get_video_fps(input)
+		if not source_fps then
+			-- fallback to mpv's idea of what the video framerate is if ffprobe fails
+			source_fps = mp.get_property_number("container-fps")
+		end
+
+		if not source_fps or source_fps <= 0 then
+			mp.msg.error("Unable to detect input frame rate; cannot configure frame blending")
+			return false
+		end
+
+		local blend_frames = math.max(1, math.floor(source_fps / output_fps + 0.5))
+		mp.msg.info(string.format(
+			"Input: %.3f FPS; applying %d-source frames for %d FPS output",
+			source_fps,
+			blend_frames,
+			output_fps
+		))
+
+		local video_filter = "crop=" .. bestCrop
+		if blend_frames > 1 then
+			local weights = {}
+			for i = 1, blend_frames do
+				table.insert(weights, "1")
+			end
+			video_filter = video_filter
+				.. ",tmix=frames=" .. blend_frames
+				.. ":weights='" .. table.concat(weights, " ") .. "'"
+		end
+		video_filter = video_filter
+			.. ",fps=" .. output_fps
+			.. ",scale=1920:1080:flags=lanczos"
+
 		-- vf runs on cpu, encode runs on gpu
 		table.insert(args, "-vf")
-		table.insert(args, "crop=" .. bestCrop .. ",tmix=frames=5:weights='1 1 1 1 1',fps=60,scale=1920:1080:flags=lanczos")
+		table.insert(args, video_filter)
 		table.insert(args, "-fps_mode")
 		table.insert(args, "cfr")
 		table.insert(args, "-c:v")
@@ -324,16 +399,16 @@ local function render_cut(input, outpath, start, duration, input_mtime)
 
 	table.insert(args, outpath)
 
-	local success = run_ffmpeg(args, false)
-
-	if success and input_mtime then
-		set_file_times(outpath, input_mtime)
+	if not remove_existing_output(outpath) then
+		return false
 	end
+
+	local success = run_ffmpeg(args, false)
 
 	return success
 end
 
-local function merge_cuts(temp_dir, filepaths, outpath, input_mtime)
+local function merge_cuts(temp_dir, filepaths, outpath)
 	-- i hate that you have to do a separate command and render each cut separately first, i tried using
 	-- filter_complex for merging with multiple inputs but it wouldn't let me. todo: look into this further
 
@@ -352,6 +427,11 @@ local function merge_cuts(temp_dir, filepaths, outpath, input_mtime)
 	file:write(content)
 	file:close()
 
+	if not remove_existing_output(outpath) then
+		os.remove(merge_file)
+		return false
+	end
+
 	local success = run_ffmpeg({
 		"-f",
 		"concat",
@@ -359,28 +439,14 @@ local function merge_cuts(temp_dir, filepaths, outpath, input_mtime)
 		"0",
 		"-i",
 		merge_file,
-		-- don't re-encode
 		"-c",
 		"copy",
-		-- copy all input streams
 		"-map",
 		"0",
 		outpath,
 	}, false)
 
 	os.remove(merge_file)
-
-	if success and input_mtime then
-		set_file_times(outpath, input_mtime)
-	end
-
-	if success then
-		for _, path in ipairs(filepaths) do
-			os.remove(path)
-		end
-	end
-
-	return success
 end
 
 local function dump_cache(outpath)
@@ -492,8 +558,7 @@ local function cut_render()
 
 			log(string.format("(%d/%d) Rendering cut to %s", i, #cuts, cut_path))
 
-			local mtime = input_info and input_info.mtime or nil
-			local success = render_cut(input, cut_path, cut.start_time - cache_offset, duration, mtime)
+			local success = render_cut(input, cut_path, cut.start_time - cache_offset, duration)
 			if success then
 				table.insert(cut_paths, cut_path)
 				log(string.format("(%d/%d) Rendered cut to %s", i, #cuts, cut_path))
@@ -514,8 +579,7 @@ local function cut_render()
 		local merge_path = join_paths(outdir, merge_name)
 
 		log("Merging cuts...")
-		local mtime = input_info and input_info.mtime or nil
-		local success = merge_cuts(outdir, cut_paths, merge_path, mtime)
+		local success = merge_cuts(outdir, cut_paths, merge_path)
 
 		if success then
 			log("Successfully merged cuts")
