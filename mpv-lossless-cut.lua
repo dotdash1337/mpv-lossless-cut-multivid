@@ -264,7 +264,7 @@ local function get_video_fps(input)
 
 	-- parse the output 
 	local average_rate, fallback_rate
-	for line in stderr:gmatch("[^\r\n]+") do
+	for line in stdout:gmatch("[^\r\n]+") do
 		local key, value = line:match("^([^=]+)=(.+)$")
 		if key == "avg_frame_rate" then
 			average_rate = value
@@ -408,45 +408,47 @@ local function render_cut(input, outpath, start, duration)
 	return success
 end
 
+
 local function merge_cuts(temp_dir, filepaths, outpath)
-	-- i hate that you have to do a separate command and render each cut separately first, i tried using
-	-- filter_complex for merging with multiple inputs but it wouldn't let me. todo: look into this further
+    local merge_file = join_paths(temp_dir, "merging.txt")
+    local content = ""
 
-	local merge_file = join_paths(temp_dir, "merging.txt")
-	local content = ""
+    for _, path in ipairs(filepaths) do
+        content = content .. string.format("file '%s'\n", ffmpeg_escape_filepath(path))
+    end
 
-	for _, path in ipairs(filepaths) do
-		content = content .. string.format("file '%s'\n", ffmpeg_escape_filepath(path))
-	end
+    local file = io.open(merge_file, "w")
+    if not file then
+        log("Failed to create merge file")
+        return false
+    end
 
-	local file = io.open(merge_file, "w")
-	if not file then
-		log("Failed to create merge file")
-		return false
-	end
-	file:write(content)
-	file:close()
+    file:write(content)
+    file:close()
 
-	if not remove_existing_output(outpath) then
-		os.remove(merge_file)
-		return false
-	end
+    if not remove_existing_output(outpath) then
+        os.remove(merge_file)
+        return false
+    end
 
-	local success = run_ffmpeg({
-		"-f",
-		"concat",
-		"-safe",
-		"0",
-		"-i",
-		merge_file,
-		"-c",
-		"copy",
-		"-map",
-		"0",
-		outpath,
-	}, false)
+    local success = run_ffmpeg({
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        merge_file,
+        "-c",
+        "copy",
+        "-map",
+        "0",
+        outpath,
+    }, false)
 
-	os.remove(merge_file)
+    os.remove(merge_file)
+
+    -- return success state
+    return success
 end
 
 local function dump_cache(outpath)
@@ -583,6 +585,15 @@ local function cut_render()
 
 		if success then
 			log("Successfully merged cuts")
+
+			-- delete individual clips
+			for _, path in ipairs(cut_paths) do
+				if delete_file(path) then
+					mp.msg.info("Deleted temporary cut: " .. path)
+				else
+					mp.msg.error("Failed to delete temporary cut: " .. path)
+				end
+			end
 		else
 			log("Failed to merge cuts")
 		end
